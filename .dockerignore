@@ -1,0 +1,24 @@
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+.env
+.git
+.gitignore
+.idea
+.vscode
+*.md
+!README.md
+# Allow migration files to be copied to Docker container
+# alembic/versions/*.py
+!alembic/versions/.gitkeep
+*.log
+.DS_Store

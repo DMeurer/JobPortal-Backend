@@ -1,0 +1,21 @@
+version: '3.8'
+
+# This file is for local development of the Backend only
+# For running the complete stack, use the docker-compose.yml in the project root
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: jobportal_postgres
+    environment:
+      POSTGRES_USER: jobportal_user
+      POSTGRES_PASSWORD: jobportal_password
+      POSTGRES_DB: jobportal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

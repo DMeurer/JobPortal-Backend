@@ -1,0 +1,13 @@
+.env
+.initial_admin_key.txt
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
