@@ -562,7 +562,13 @@ class JobService:
         return query.all(), total
 
     @staticmethod
-    def get_jobs_statistics(db: Session, api_key: Optional[models.APIKey] = None) -> List[dict]:
+    def get_jobs_statistics(
+        db: Session,
+        api_key: Optional[models.APIKey] = None,
+        company_name: Optional[str] = None,
+        company_names: Optional[List[str]] = None,
+        found_on_date: Optional[date] = None
+    ) -> List[dict]:
         """
         Get job statistics grouped by company and date.
 
@@ -574,6 +580,9 @@ class JobService:
         Args:
             db: Database session
             api_key: API key to check hidden permissions
+            company_name: Filter by company name (exact match)
+            company_names: Filter by multiple company names
+            found_on_date: Filter to only include this specific date
 
         Returns:
             List of dictionaries with company statistics (filtered by hidden status)
@@ -594,6 +603,12 @@ class JobService:
 
         # Apply hidden filter
         query = JobService._apply_hidden_filter(query, api_key)
+
+        # Apply company filters
+        if company_name:
+            query = query.filter(models.Company.name == company_name)
+        if company_names:
+            query = query.filter(models.Company.name.in_(company_names))
 
         query = query.order_by(
             models.Company.name,
@@ -619,19 +634,24 @@ class JobService:
 
         # Calculate statistics for each company
         result = []
-        for company_name, date_jobs in company_date_jobs.items():
+        for comp_name, date_jobs in company_date_jobs.items():
             # Sort dates in descending order
             sorted_dates = sorted(date_jobs.keys(), reverse=True)
 
             dates_stats = []
             for i, current_date in enumerate(sorted_dates):
+                # Skip dates that don't match the filter (if specified)
+                if found_on_date and current_date != found_on_date:
+                    continue
+
                 current_jobs = date_jobs[current_date]
                 open_positions = len(current_jobs)
 
                 # Calculate newly added and removed compared to previous date
-                if i < len(sorted_dates) - 1:
-                    # Previous date exists (chronologically before current)
-                    previous_date = sorted_dates[i + 1]
+                # Find the previous date in the sorted list
+                prev_idx = i + 1
+                if prev_idx < len(sorted_dates):
+                    previous_date = sorted_dates[prev_idx]
                     previous_jobs = date_jobs[previous_date]
 
                     newly_added = len(current_jobs - previous_jobs)
@@ -648,10 +668,12 @@ class JobService:
                     'removed': removed
                 })
 
-            result.append({
-                'company_name': company_name,
-                'dates': dates_stats
-            })
+            # Only include company if it has matching dates
+            if dates_stats:
+                result.append({
+                    'company_name': comp_name,
+                    'dates': dates_stats
+                })
 
         return result
 

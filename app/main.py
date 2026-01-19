@@ -171,7 +171,7 @@ def get_jobs(
     company_name: Optional[str] = Query(None, description="Filter by company name (exact match)"),
     company_names: Optional[str] = Query(None, description="Filter by multiple company names (comma-separated)"),
     company_id: Optional[int] = Query(None, description="Filter by company ID"),
-    found_on_date: Optional[date] = Query(None, description="Filter by scrape date (YYYY-MM-DD)"),
+    found_on_date: Optional[str] = Query(None, description="Filter by scrape date (YYYY-MM-DD or 'today')"),
     job_status: Optional[str] = Query(None, description="Filter by job status: 'new', 'existing', or 'removed' (requires found_on_date and company_name)"),
     title_contains: Optional[str] = Query(None, description="Filter jobs containing this substring in title"),
     title_excludes: Optional[str] = Query(None, description="Exclude jobs containing this substring in title"),
@@ -200,7 +200,7 @@ def get_jobs(
         company_name: Filter by company name (exact match)
         company_names: Filter by multiple company names (comma-separated)
         company_id: Filter by company ID
-        found_on_date: Filter by scrape date - only jobs found on this date
+        found_on_date: Filter by scrape date (YYYY-MM-DD or 'today') - only jobs found on this date
         job_status: Filter by job status on the given date:
             - 'new': Jobs that appeared on this date (not on previous date)
             - 'existing': Jobs that existed on both this date and previous date
@@ -224,23 +224,40 @@ def get_jobs(
         Paginated list of jobs matching the filters OR statistics object
     """
     try:
-        # Return statistics if requested
-        if statistics:
-            companies_data = services.JobService.get_jobs_statistics(db, current_key)
-            return schemas.JobStatistics(companies=companies_data)
-
         # Parse comma-separated values
         company_names_list = [c.strip() for c in company_names.split(',')] if company_names else None
         levels_list = [l.strip() for l in levels.split(',')] if levels else None
 
-        # Otherwise return filtered jobs
+        # Parse found_on_date - accept "today" or YYYY-MM-DD format
+        parsed_found_on_date = None
+        if found_on_date:
+            if found_on_date.lower() == "today":
+                parsed_found_on_date = date.today()
+            else:
+                try:
+                    parsed_found_on_date = date.fromisoformat(found_on_date)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD or 'today'")
+
+        # Return statistics if requested
+        if statistics:
+            companies_data = services.JobService.get_jobs_statistics(
+                db=db,
+                api_key=current_key,
+                company_name=company_name,
+                company_names=company_names_list,
+                found_on_date=parsed_found_on_date
+            )
+            return schemas.JobStatistics(companies=companies_data)
+
+        # Return filtered jobs
         results, total = services.JobService.get_jobs_with_filters(
             db=db,
             api_key=current_key,
             company_name=company_name,
             company_names=company_names_list,
             company_id=company_id,
-            found_on_date=found_on_date,
+            found_on_date=parsed_found_on_date,
             job_status=job_status,
             title_contains=title_contains,
             title_excludes=title_excludes,
