@@ -233,3 +233,22 @@ class CompanyStatistics(BaseModel):
 
 class JobStatistics(BaseModel):
     companies: List[CompanyStatistics]
+
+
+class PaginatedJobSearchResult(BaseModel):
+    jobs: List[JobSearchResult]
+    total: int
+    skip: int
+    limit: int
+
+    class Config:
+        from_attributes = True
+
+
+class FilterOptions(BaseModel):
+    companies: List[str]
+    levels: List[str]
+    functions: List[str]
+
+    class Config:
+        from_attributes = True

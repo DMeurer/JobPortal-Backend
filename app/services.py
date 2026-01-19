@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from datetime import date
 from typing import Optional, List
 from app import models, schemas
+from app.sanitize import sanitize_like_pattern, sanitize_regex, sanitize_string
 
 
 class JobService:
@@ -260,16 +261,18 @@ class JobService:
         """
         from sqlalchemy import or_
 
-        search_pattern = f"%{search_query}%"
+        # Sanitize search query for LIKE pattern
+        sanitized_query = sanitize_like_pattern(sanitize_string(search_query))
+        search_pattern = f"%{sanitized_query}%" if sanitized_query else "%"
 
         query = db.query(models.Job, models.Company).join(
             models.Company,
             models.Job.company_id == models.Company.id
         ).filter(
             or_(
-                models.Job.title.ilike(search_pattern),
-                models.Job.function.ilike(search_pattern),
-                models.Job.keywords.ilike(search_pattern)
+                models.Job.title.ilike(search_pattern, escape='\\'),
+                models.Job.function.ilike(search_pattern, escape='\\'),
+                models.Job.keywords.ilike(search_pattern, escape='\\')
             )
         )
 
@@ -300,21 +303,94 @@ class JobService:
         return query.first()
 
     @staticmethod
+    def _get_adjacent_date(db: Session, company_name: str, current_date: date, direction: str, api_key: Optional[models.APIKey] = None) -> Optional[date]:
+        """
+        Get the previous or next scrape date for a company.
+
+        Args:
+            db: Database session
+            company_name: Company name to filter by
+            current_date: The reference date
+            direction: 'previous' or 'next'
+            api_key: API key to check hidden permissions
+
+        Returns:
+            Adjacent date or None if not found
+        """
+        from sqlalchemy import func as sql_func
+
+        query = db.query(models.Insert.scrape_date).join(
+            models.Job,
+            models.Insert.job_id == models.Job.id
+        ).join(
+            models.Company,
+            models.Job.company_id == models.Company.id
+        ).filter(
+            models.Company.name == company_name
+        )
+
+        query = JobService._apply_hidden_filter(query, api_key)
+
+        if direction == 'previous':
+            query = query.filter(models.Insert.scrape_date < current_date).order_by(models.Insert.scrape_date.desc())
+        else:
+            query = query.filter(models.Insert.scrape_date > current_date).order_by(models.Insert.scrape_date.asc())
+
+        result = query.first()
+        return result[0] if result else None
+
+    @staticmethod
+    def _get_job_ids_on_date(db: Session, company_name: str, target_date: date, api_key: Optional[models.APIKey] = None) -> set:
+        """
+        Get all job IDs for a company on a specific date.
+
+        Args:
+            db: Database session
+            company_name: Company name to filter by
+            target_date: The date to check
+            api_key: API key to check hidden permissions
+
+        Returns:
+            Set of job IDs
+        """
+        query = db.query(models.Job.id).join(
+            models.Company,
+            models.Job.company_id == models.Company.id
+        ).join(
+            models.Insert,
+            models.Job.id == models.Insert.job_id
+        ).filter(
+            models.Company.name == company_name,
+            models.Insert.scrape_date == target_date
+        )
+
+        query = JobService._apply_hidden_filter(query, api_key)
+        return {r[0] for r in query.all()}
+
+    @staticmethod
     def get_jobs_with_filters(
         db: Session,
         api_key: Optional[models.APIKey] = None,
         company_name: Optional[str] = None,
+        company_names: Optional[List[str]] = None,
         company_id: Optional[int] = None,
         found_on_date: Optional[date] = None,
+        job_status: Optional[str] = None,
         title_contains: Optional[str] = None,
         title_excludes: Optional[str] = None,
+        title_regex: Optional[str] = None,
         level: Optional[str] = None,
+        levels: Optional[List[str]] = None,
         contract_type: Optional[str] = None,
         location: Optional[str] = None,
         function: Optional[str] = None,
+        function_regex: Optional[str] = None,
         department: Optional[str] = None,
-        keywords: Optional[str] = None
-    ) -> List[tuple]:
+        keywords: Optional[str] = None,
+        skip: int = 0,
+        limit: Optional[int] = None,
+        count_only: bool = False
+    ) -> tuple[List[tuple], int]:
         """
         Get jobs with optional filters.
 
@@ -322,21 +398,70 @@ class JobService:
             db: Database session
             api_key: API key to check hidden permissions
             company_name: Filter by company name (exact match)
+            company_names: Filter by multiple company names
             company_id: Filter by company ID
             found_on_date: Filter by scrape date (jobs found on this date)
+            job_status: Filter by job status on the date: 'new', 'existing', 'removed'
+                - 'new': Jobs on this date that weren't on the previous date
+                - 'existing': Jobs on this date that were also on the previous date
+                - 'removed': Jobs on this date that aren't on the next date
             title_contains: Filter jobs that contain this substring in title
             title_excludes: Filter out jobs that contain this substring in title
+            title_regex: Filter jobs by regex pattern in title
             level: Filter by level (exact match)
+            levels: Filter by multiple levels
             contract_type: Filter by contract type (exact match)
             location: Filter by location (substring search in work_location or work_location_short)
             function: Filter by function (substring search)
+            function_regex: Filter by regex pattern in function
             department: Filter by department (substring search)
             keywords: Filter by keywords (substring search)
+            skip: Number of records to skip (for pagination)
+            limit: Maximum number of records to return
+            count_only: If True, only return the count
 
         Returns:
-            List of tuples with (Job, Company) instances (filtered by hidden status)
+            Tuple of (List of tuples with (Job, Company) instances, total count)
         """
-        from sqlalchemy import and_
+        from sqlalchemy import and_, or_, func as sql_func
+
+        # Handle job_status filtering which requires comparing dates
+        job_id_filter = None
+        query_date = found_on_date  # The date to actually query jobs from
+        if found_on_date and job_status and company_name:
+            current_job_ids = JobService._get_job_ids_on_date(db, company_name, found_on_date, api_key)
+
+            if job_status == 'new':
+                # Jobs on current date that weren't on the previous date
+                prev_date = JobService._get_adjacent_date(db, company_name, found_on_date, 'previous', api_key)
+                if prev_date:
+                    prev_job_ids = JobService._get_job_ids_on_date(db, company_name, prev_date, api_key)
+                    job_id_filter = current_job_ids - prev_job_ids
+                else:
+                    # No previous date, all jobs are "new"
+                    job_id_filter = current_job_ids
+            elif job_status == 'existing':
+                # Jobs on current date that were also on the previous date
+                prev_date = JobService._get_adjacent_date(db, company_name, found_on_date, 'previous', api_key)
+                if prev_date:
+                    prev_job_ids = JobService._get_job_ids_on_date(db, company_name, prev_date, api_key)
+                    job_id_filter = current_job_ids & prev_job_ids
+                else:
+                    # No previous date, no "existing" jobs
+                    job_id_filter = set()
+            elif job_status == 'removed':
+                # "Removed" on date X means: jobs that were on the PREVIOUS date but NOT on date X
+                # So we need to query from the previous date and filter to jobs not on current date
+                prev_date = JobService._get_adjacent_date(db, company_name, found_on_date, 'previous', api_key)
+                if prev_date:
+                    prev_job_ids = JobService._get_job_ids_on_date(db, company_name, prev_date, api_key)
+                    # Jobs on previous date that are NOT on current date
+                    job_id_filter = prev_job_ids - current_job_ids
+                    # Query from the previous date since that's where these jobs exist
+                    query_date = prev_date
+                else:
+                    # No previous date, no jobs are considered "removed"
+                    job_id_filter = set()
 
         # Base query with company join
         query = db.query(models.Job, models.Company).join(
@@ -344,60 +469,97 @@ class JobService:
             models.Job.company_id == models.Company.id
         )
 
-        # If filtering by found_on_date, need to join with Insert table
+        # If filtering by date, need to join with Insert table
+        # Use query_date which may differ from found_on_date for 'removed' status
         if found_on_date:
             query = query.join(
                 models.Insert,
                 models.Job.id == models.Insert.job_id
-            ).filter(models.Insert.scrape_date == found_on_date)
+            ).filter(models.Insert.scrape_date == query_date)
+
+        # Apply job_id_filter if we have one from job_status
+        if job_id_filter is not None:
+            if len(job_id_filter) == 0:
+                # No matching jobs, return empty result
+                return [], 0
+            query = query.filter(models.Job.id.in_(job_id_filter))
 
         # Apply filters
         if company_name:
             query = query.filter(models.Company.name == company_name)
 
+        if company_names:
+            query = query.filter(models.Company.name.in_(company_names))
+
         if company_id:
             query = query.filter(models.Company.id == company_id)
 
         if title_contains:
-            query = query.filter(models.Job.title.ilike(f"%{title_contains}%"))
+            sanitized = sanitize_like_pattern(sanitize_string(title_contains))
+            query = query.filter(models.Job.title.ilike(f"%{sanitized}%", escape='\\'))
 
         if title_excludes:
-            query = query.filter(~models.Job.title.ilike(f"%{title_excludes}%"))
+            sanitized = sanitize_like_pattern(sanitize_string(title_excludes))
+            query = query.filter(~models.Job.title.ilike(f"%{sanitized}%", escape='\\'))
+
+        if title_regex:
+            sanitized = sanitize_regex(sanitize_string(title_regex))
+            query = query.filter(models.Job.title.op('~*')(sanitized))
 
         if level:
             query = query.filter(models.Job.level == level)
+
+        if levels:
+            query = query.filter(models.Job.level.in_(levels))
 
         if contract_type:
             query = query.filter(models.Job.contract_type == contract_type)
 
         if location:
-            from sqlalchemy import or_
+            sanitized = sanitize_like_pattern(sanitize_string(location))
             query = query.filter(
                 or_(
-                    models.Job.work_location.ilike(f"%{location}%"),
-                    models.Job.work_location_short.ilike(f"%{location}%"),
-                    models.Job.all_locations.ilike(f"%{location}%")
+                    models.Job.work_location.ilike(f"%{sanitized}%", escape='\\'),
+                    models.Job.work_location_short.ilike(f"%{sanitized}%", escape='\\'),
+                    models.Job.all_locations.ilike(f"%{sanitized}%", escape='\\')
                 )
             )
 
         if function:
-            query = query.filter(models.Job.function.ilike(f"%{function}%"))
+            sanitized = sanitize_like_pattern(sanitize_string(function))
+            query = query.filter(models.Job.function.ilike(f"%{sanitized}%", escape='\\'))
+
+        if function_regex:
+            sanitized = sanitize_regex(sanitize_string(function_regex))
+            query = query.filter(models.Job.function.op('~*')(sanitized))
 
         if department:
-            query = query.filter(models.Job.department.ilike(f"%{department}%"))
+            sanitized = sanitize_like_pattern(sanitize_string(department))
+            query = query.filter(models.Job.department.ilike(f"%{sanitized}%", escape='\\'))
 
         if keywords:
-            query = query.filter(models.Job.keywords.ilike(f"%{keywords}%"))
+            sanitized = sanitize_like_pattern(sanitize_string(keywords))
+            query = query.filter(models.Job.keywords.ilike(f"%{sanitized}%", escape='\\'))
 
         # Apply hidden filter based on API key permissions
         query = JobService._apply_hidden_filter(query, api_key)
 
-        # Execute query and return results
         # Use distinct() in case found_on_date creates duplicates
         if found_on_date:
             query = query.distinct()
 
-        return query.all()
+        # Get total count before pagination
+        total = query.count()
+
+        if count_only:
+            return [], total
+
+        # Apply pagination
+        query = query.offset(skip)
+        if limit:
+            query = query.limit(limit)
+
+        return query.all(), total
 
     @staticmethod
     def get_jobs_statistics(db: Session, api_key: Optional[models.APIKey] = None) -> List[dict]:
@@ -492,6 +654,90 @@ class JobService:
             })
 
         return result
+
+    def get_statistics_online_time(self, db: Session, company_name: Optional[str] = None):
+        """
+        Get statistics on how long jobs have been online for each company.
+
+        Args:
+            db: Database session
+            company_name: Optional company name to filter results
+        Returns:
+            List of dictionaries with job online time statistics
+        """
+        """
+        SQL query would be:
+        
+        SELECT online_duration as online_days, COUNT(id) AS job_count
+        FROM
+            (SELECT recent.id, recent.scrape_date AS recent_date, oldest.scrape_date AS oldest_date,
+                (recent.scrape_date - oldest.scrape_date) AS online_duration
+            FROM
+                (SELECT j.id, max(i.scrape_date) as scrape_date
+                FROM inserts i, jobs j
+                WHERE
+                    i.job_id = j.id
+                GROUP BY j.id) AS recent,
+                (SELECT j.id , min(i.scrape_date) as scrape_date
+                FROM inserts i, jobs j
+                WHERE
+                    i.job_id = j.id
+                GROUP BY j.id) AS oldest
+            WHERE recent.id = oldest.id
+                AND recent.scrape_date > oldest.scrape_date
+            ) as durations
+        WHERE durations.recent_date != '2026-01-12'
+        GROUP BY online_duration
+        ORDER BY online_duration DESC;
+        """
+        return ""
+
+    @staticmethod
+    def get_filter_options(db: Session, api_key: Optional[models.APIKey] = None) -> dict:
+        """
+        Get distinct values for filter dropdowns.
+
+        Args:
+            db: Database session
+            api_key: API key to check hidden permissions
+
+        Returns:
+            Dictionary with lists of distinct companies, levels, and functions
+        """
+        from sqlalchemy import distinct
+
+        # Get companies
+        company_query = db.query(distinct(models.Company.name)).join(
+            models.Job,
+            models.Company.id == models.Job.company_id
+        )
+        company_query = JobService._apply_hidden_filter(company_query, api_key)
+        companies = [c[0] for c in company_query.all() if c[0]]
+        companies.sort()
+
+        # Get levels
+        level_query = db.query(distinct(models.Job.level)).join(
+            models.Company,
+            models.Job.company_id == models.Company.id
+        )
+        level_query = JobService._apply_hidden_filter(level_query, api_key)
+        levels = [l[0] for l in level_query.all() if l[0]]
+        levels.sort()
+
+        # Get functions
+        function_query = db.query(distinct(models.Job.function)).join(
+            models.Company,
+            models.Job.company_id == models.Company.id
+        )
+        function_query = JobService._apply_hidden_filter(function_query, api_key)
+        functions = [f[0] for f in function_query.all() if f[0]]
+        functions.sort()
+
+        return {
+            'companies': companies,
+            'levels': levels,
+            'functions': functions
+        }
 
 
 class APIKeyService:
