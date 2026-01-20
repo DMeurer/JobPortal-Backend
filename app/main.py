@@ -276,14 +276,26 @@ def get_jobs(
 
         # Convert results to JobSearchResult format
         job_results = []
-        for job, company in results:
+        for job, company, first_seen, last_seen in results:
             job_results.append(schemas.JobSearchResult(
                 id=job.id,
                 company_name=company.name,
+                job_id=job.job_id,
+                url=job.url,
                 title=job.title,
+                function=job.function,
                 level=job.level,
                 contract_type=job.contract_type,
-                location=job.work_location_short or job.work_location
+                work_location=job.work_location,
+                work_location_short=job.work_location_short,
+                all_locations=job.all_locations,
+                country=job.country,
+                department=job.department,
+                flexibility=job.flexibility,
+                keywords=job.keywords,
+                date_added=job.date_added,
+                first_seen=first_seen,
+                last_seen=last_seen
             ))
 
         return schemas.PaginatedJobSearchResult(
@@ -317,14 +329,26 @@ def search_jobs(
 
         # Convert results to JobSearchResult format
         search_results = []
-        for job, company in results:
+        for job, company, first_seen, last_seen in results:
             search_results.append(schemas.JobSearchResult(
                 id=job.id,
                 company_name=company.name,
+                job_id=job.job_id,
+                url=job.url,
                 title=job.title,
+                function=job.function,
                 level=job.level,
                 contract_type=job.contract_type,
-                location=job.work_location_short or job.work_location
+                work_location=job.work_location,
+                work_location_short=job.work_location_short,
+                all_locations=job.all_locations,
+                country=job.country,
+                department=job.department,
+                flexibility=job.flexibility,
+                keywords=job.keywords,
+                date_added=job.date_added,
+                first_seen=first_seen,
+                last_seen=last_seen
             ))
 
         return search_results

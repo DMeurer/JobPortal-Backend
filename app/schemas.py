@@ -178,10 +178,22 @@ class APIKey(BaseModel):
 class JobSearchResult(BaseModel):
     id: int
     company_name: str
+    job_id: Optional[str] = None
+    url: Optional[str] = None
     title: Optional[str] = None
+    function: Optional[str] = None
     level: Optional[str] = None
     contract_type: Optional[str] = None
-    location: Optional[str] = None
+    work_location: Optional[str] = None
+    work_location_short: Optional[str] = None
+    all_locations: Optional[str] = None
+    country: Optional[str] = None
+    department: Optional[str] = None
+    flexibility: Optional[str] = None
+    keywords: Optional[str] = None
+    date_added: Optional[date] = None
+    first_seen: Optional[date] = None
+    last_seen: Optional[date] = None
 
     class Config:
         from_attributes = True

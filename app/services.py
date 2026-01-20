@@ -257,17 +257,39 @@ class JobService:
             api_key: API key to check hidden permissions
 
         Returns:
-            List of tuples with (Job, Company) instances (filtered by hidden status)
+            List of tuples with (Job, Company, first_seen, last_seen) instances (filtered by hidden status)
         """
-        from sqlalchemy import or_
+        from sqlalchemy import or_, func as sql_func
+
+        # Subqueries for first_seen and last_seen dates
+        first_seen_subq = db.query(
+            models.Insert.job_id,
+            sql_func.min(models.Insert.scrape_date).label('first_seen')
+        ).group_by(models.Insert.job_id).subquery()
+
+        last_seen_subq = db.query(
+            models.Insert.job_id,
+            sql_func.max(models.Insert.scrape_date).label('last_seen')
+        ).group_by(models.Insert.job_id).subquery()
 
         # Sanitize search query for LIKE pattern
         sanitized_query = sanitize_like_pattern(sanitize_string(search_query))
         search_pattern = f"%{sanitized_query}%" if sanitized_query else "%"
 
-        query = db.query(models.Job, models.Company).join(
+        query = db.query(
+            models.Job,
+            models.Company,
+            first_seen_subq.c.first_seen,
+            last_seen_subq.c.last_seen
+        ).join(
             models.Company,
             models.Job.company_id == models.Company.id
+        ).outerjoin(
+            first_seen_subq,
+            models.Job.id == first_seen_subq.c.job_id
+        ).outerjoin(
+            last_seen_subq,
+            models.Job.id == last_seen_subq.c.job_id
         ).filter(
             or_(
                 models.Job.title.ilike(search_pattern, escape='\\'),
@@ -424,6 +446,18 @@ class JobService:
             Tuple of (List of tuples with (Job, Company) instances, total count)
         """
         from sqlalchemy import and_, or_, func as sql_func
+        from sqlalchemy.orm import aliased
+
+        # Subqueries for first_seen and last_seen dates
+        first_seen_subq = db.query(
+            models.Insert.job_id,
+            sql_func.min(models.Insert.scrape_date).label('first_seen')
+        ).group_by(models.Insert.job_id).subquery()
+
+        last_seen_subq = db.query(
+            models.Insert.job_id,
+            sql_func.max(models.Insert.scrape_date).label('last_seen')
+        ).group_by(models.Insert.job_id).subquery()
 
         # Handle job_status filtering which requires comparing dates
         job_id_filter = None
@@ -463,10 +497,21 @@ class JobService:
                     # No previous date, no jobs are considered "removed"
                     job_id_filter = set()
 
-        # Base query with company join
-        query = db.query(models.Job, models.Company).join(
+        # Base query with company join and first_seen/last_seen
+        query = db.query(
+            models.Job,
+            models.Company,
+            first_seen_subq.c.first_seen,
+            last_seen_subq.c.last_seen
+        ).join(
             models.Company,
             models.Job.company_id == models.Company.id
+        ).outerjoin(
+            first_seen_subq,
+            models.Job.id == first_seen_subq.c.job_id
+        ).outerjoin(
+            last_seen_subq,
+            models.Job.id == last_seen_subq.c.job_id
         )
 
         # If filtering by date, need to join with Insert table
