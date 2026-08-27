@@ -29,144 +29,51 @@ from app.sanitize import sanitize_like_pattern, sanitize_regex, sanitize_string
 # `removed` uses a set identity rather than a second 240k-row join:
 #     removed(d) = |P \ D| = |P| - |P n D| = open(prev) - open(d) + new(d)
 # which reduces it to a LAG over the ~1.8k-row aggregate.
-# Lower bound for the presence scan, resolved BEFORE the main query.
+# Statistics are served from the `company_date_statistics` materialized view
+# (migration d5a9c71e3f82), which holds one row per scope, company and date.
+# Filtering it is an indexed scan of a few thousand rows instead of recomputing
+# the whole history from ~240k insert rows on every request.
 #
-# This deliberately does not live inside _JOB_STATISTICS_SQL. Postgres cannot
-# estimate the selectivity of `scrape_date >= (SELECT ...)`, so it falls back to
-# a default guess and underestimated the surviving rows by ~60x (1.2k estimated
-# vs 72k actual). Downstream that flips the presence self-join from a hash join
-# to a nested loop over tens of thousands of rows on each side, which does not
-# finish. Passing a plain date instead lets the planner use real column
-# statistics.
+# The view carries an `include_hidden` dimension because the numbers are not
+# permission-independent: `companies` has a unique index on (name, hidden), so
+# one name can be two rows which the API merges by name. An admin sees both
+# halves combined, a public key sees only the visible half, and those are
+# genuinely different numbers for the same (name, date).
 #
-# Aggregate-only, so it is cheap despite touching the whole inserts table.
-_STATISTICS_LEAD_IN_SQL = text("""
-SELECT min(prev_date) AS lower_bound
-FROM (
-    SELECT max(i.scrape_date) AS prev_date
-    FROM inserts i
-    JOIN jobs      j ON i.job_id     = j.id
-    JOIN companies c ON j.company_id = c.id
-    WHERE (:include_hidden OR c.hidden = false)
-      AND (CAST(:company_name AS varchar) IS NULL OR c.name = :company_name)
-      AND (CAST(:company_names AS varchar[]) IS NULL
-           OR c.name = ANY(CAST(:company_names AS varchar[])))
-      AND i.scrape_date < :date_from
-    GROUP BY c.name
-) per_company
-""")
-
-
+# Everything else is pure row selection: company filters, the date window and
+# found_on_date all narrow the output without changing any value, because
+# newly_added/removed were computed in the view against the true previous scrape
+# date for that company.
 _JOB_STATISTICS_SQL = text("""
-WITH company_key AS (
-    SELECT
-        c.id                                 AS company_id,
-        min(c.id) OVER (PARTITION BY c.name) AS name_key,
-        c.name                               AS company_name
-    FROM companies c
-    WHERE (:include_hidden OR c.hidden = false)
-      AND (CAST(:company_name AS varchar) IS NULL OR c.name = :company_name)
-      AND (CAST(:company_names AS varchar[]) IS NULL
-           OR c.name = ANY(CAST(:company_names AS varchar[])))
-),
--- Every (company, scrape_date) pair. Aggregate only, so this stays cheap even
--- though it touches the whole inserts table.
-all_days AS (
-    SELECT ck.name_key, i.scrape_date
-    FROM inserts i
-    JOIN jobs        j  ON i.job_id     = j.id
-    JOIN company_key ck ON j.company_id = ck.company_id
-    GROUP BY ck.name_key, i.scrape_date
-),
--- The last scrape date strictly BEFORE the requested window, per company.
--- The first in-window date must still be diffed against this, otherwise it
--- would report every open position as newly added.
-lead_in AS (
-    SELECT name_key, max(scrape_date) AS scrape_date
-    FROM all_days
-    WHERE CAST(:date_from AS date) IS NOT NULL
-      AND scrape_date < :date_from
-    GROUP BY name_key
-),
--- Window plus one lead-in row per company. The lead-in row is dropped at the
--- very end; it exists so LAG(open_positions) has something to read.
-day AS (
-    SELECT d.name_key, d.scrape_date, d.prev_date
-    FROM (
-        SELECT
-            name_key,
-            scrape_date,
-            LAG(scrape_date) OVER (
-                PARTITION BY name_key ORDER BY scrape_date
-            ) AS prev_date
-        FROM all_days
-    ) d
-    LEFT JOIN lead_in li ON li.name_key = d.name_key
-    WHERE (CAST(:date_to AS date) IS NULL OR d.scrape_date <= :date_to)
-      AND (CAST(:date_from AS date) IS NULL
-           OR d.scrape_date >= COALESCE(li.scrape_date, :date_from))
-),
--- Only the job rows the window actually needs. This is what makes a narrow
--- range cheaper to compute, rather than merely cheaper to transfer.
--- :presence_from is resolved by _STATISTICS_LEAD_IN_SQL rather than computed
--- inline, so the planner can estimate this filter from real statistics.
-presence AS (
-    SELECT DISTINCT
-        ck.name_key,
-        i.scrape_date,
-        i.job_id
-    FROM inserts i
-    JOIN jobs        j  ON i.job_id     = j.id
-    JOIN company_key ck ON j.company_id = ck.company_id
-    WHERE (CAST(:date_to AS date) IS NULL OR i.scrape_date <= :date_to)
-      AND (CAST(:presence_from AS date) IS NULL
-           OR i.scrape_date >= CAST(:presence_from AS date))
-),
-agg AS (
-    SELECT
-        d.name_key,
-        d.scrape_date,
-        count(*)                                 AS open_positions,
-        count(*) FILTER (WHERE p.job_id IS NULL) AS newly_added
-    FROM day d
-    JOIN presence c
-      ON c.name_key    = d.name_key
-     AND c.scrape_date = d.scrape_date
-    LEFT JOIN presence p
-      ON p.name_key    = d.name_key
-     AND p.scrape_date = d.prev_date
-     AND p.job_id      = c.job_id
-    GROUP BY d.name_key, d.scrape_date
-),
-final AS (
-    SELECT
-        name_key,
-        scrape_date,
-        open_positions,
-        newly_added,
-        COALESCE(
-            LAG(open_positions) OVER (PARTITION BY name_key ORDER BY scrape_date)
-              - open_positions + newly_added,
-            0
-        ) AS removed
-    FROM agg
-),
-names AS (
-    SELECT DISTINCT name_key, company_name FROM company_key
-)
 SELECT
-    n.company_name,
-    f.scrape_date,
-    f.open_positions,
-    f.newly_added,
-    f.removed
-FROM final f
-JOIN names n ON n.name_key = f.name_key
-WHERE (CAST(:found_on_date AS date) IS NULL OR f.scrape_date = :found_on_date)
-  -- drop the lead-in row that only existed to seed LAG
-  AND (CAST(:date_from AS date) IS NULL OR f.scrape_date >= :date_from)
-ORDER BY n.company_name, f.scrape_date DESC
+    company_name,
+    scrape_date,
+    open_positions,
+    newly_added,
+    removed
+FROM company_date_statistics
+WHERE include_hidden = :include_hidden
+  AND (CAST(:company_name AS varchar) IS NULL OR company_name = :company_name)
+  AND (CAST(:company_names AS varchar[]) IS NULL
+       OR company_name = ANY(CAST(:company_names AS varchar[])))
+  AND (CAST(:found_on_date AS date) IS NULL OR scrape_date = :found_on_date)
+  AND (CAST(:date_from AS date) IS NULL OR scrape_date >= :date_from)
+  AND (CAST(:date_to AS date) IS NULL OR scrape_date <= :date_to)
+ORDER BY company_name, scrape_date DESC
 """)
+
+
+# Rebuild the materialized view. CONCURRENTLY keeps it readable throughout, at
+# the cost of needing the unique index the migration creates.
+_REFRESH_STATISTICS_SQL = text(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY company_date_statistics"
+)
+
+# CONCURRENTLY cannot populate a view that has never been populated, so a first
+# refresh (or one after a manual TRUNCATE-like reset) falls back to this.
+_REFRESH_STATISTICS_BLOCKING_SQL = text(
+    "REFRESH MATERIALIZED VIEW company_date_statistics"
+)
 
 
 class JobService:
@@ -817,37 +724,19 @@ class JobService:
         Returns:
             List of dictionaries with company statistics (filtered by hidden status)
         """
-        # Mirrors _apply_hidden_filter: admin or read_hidden sees hidden companies.
+        # Mirrors _apply_hidden_filter: admin or read_hidden sees hidden companies,
+        # and selects which of the view's two scopes to read.
         include_hidden = bool(api_key and (api_key.read_hidden or api_key.admin))
-
-        filters = {
-            "include_hidden": include_hidden,
-            "company_name": company_name,
-            "company_names": list(company_names) if company_names else None,
-        }
-
-        # Resolve how far back the presence scan must reach. The window's first
-        # reported date is diffed against the last scrape date before it, so that
-        # date's rows have to be in scope. Done as a separate aggregate query so
-        # the main query receives a plain date it can plan against - see the note
-        # on _STATISTICS_LEAD_IN_SQL.
-        presence_from = None
-        if date_from is not None:
-            presence_from = db.execute(
-                _STATISTICS_LEAD_IN_SQL, {**filters, "date_from": date_from}
-            ).scalar()
-            # No company has data before the window; nothing to reach back to.
-            if presence_from is None:
-                presence_from = date_from
 
         rows = db.execute(
             _JOB_STATISTICS_SQL,
             {
-                **filters,
+                "include_hidden": include_hidden,
+                "company_name": company_name,
+                "company_names": list(company_names) if company_names else None,
                 "found_on_date": found_on_date,
                 "date_from": date_from,
                 "date_to": date_to,
-                "presence_from": presence_from,
             },
         ).all()
 
@@ -882,6 +771,40 @@ class JobService:
             })
 
         return result
+
+    @staticmethod
+    def refresh_statistics(db: Session) -> dict:
+        """
+        Rebuild the company_date_statistics materialized view.
+
+        Must be run after new inserts land, otherwise the dashboard keeps
+        serving the previous scrape's numbers. Safe to run at any time - it is a
+        full recompute from `inserts`, so it repairs the view no matter how it
+        got out of step.
+
+        Returns:
+            {'rows': int, 'concurrent': bool} describing what was rebuilt.
+        """
+        try:
+            # CONCURRENTLY leaves the view readable while it rebuilds, so
+            # requests during a refresh see the old data rather than an error.
+            db.execute(_REFRESH_STATISTICS_SQL)
+            db.commit()
+            concurrent = True
+        except Exception:
+            # CONCURRENTLY refuses to populate a view that has never been
+            # populated. Fall back to the blocking form, which briefly locks
+            # readers but always works.
+            db.rollback()
+            db.execute(_REFRESH_STATISTICS_BLOCKING_SQL)
+            db.commit()
+            concurrent = False
+
+        rows = db.execute(
+            text("SELECT count(*) FROM company_date_statistics")
+        ).scalar()
+
+        return {'rows': int(rows or 0), 'concurrent': concurrent}
 
     def get_statistics_online_time(self, db: Session, company_name: Optional[str] = None):
         """

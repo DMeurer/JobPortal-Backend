@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+import hashlib
+
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional, Union
@@ -152,6 +154,35 @@ def list_api_keys(
     return APIKeyService.get_all_api_keys(db)
 
 
+@app.post("/api/statistics/refresh")
+def refresh_statistics(
+    db: Session = Depends(get_db),
+    current_key: models.APIKey = Depends(require_write_permission)
+):
+    """
+    Rebuild the statistics materialized view (requires write permission).
+
+    Statistics are precomputed, so they do not change until this runs. Scrapers
+    should call it once after a run completes. It is a full recompute from
+    `inserts`, so it is safe to call at any time and repairs the view however it
+    got out of step.
+
+    Returns:
+        Number of rows in the rebuilt view and whether it rebuilt concurrently
+    """
+    try:
+        result = services.JobService.refresh_statistics(db)
+        return {
+            "status": "ok",
+            "rows": result["rows"],
+            "concurrent": result["concurrent"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/jobs/filters", response_model=schemas.FilterOptions)
 def get_filter_options(
     db: Session = Depends(get_db),
@@ -172,6 +203,7 @@ def get_filter_options(
 
 @app.get("/api/jobs")
 def get_jobs(
+    request: Request,
     statistics: bool = Query(False, description="Return statistics instead of job list"),
     company_name: Optional[str] = Query(None, description="Filter by company name (exact match)"),
     company_names: Optional[str] = Query(None, description="Filter by multiple company names (comma-separated)"),
@@ -289,7 +321,31 @@ def get_jobs(
                 date_from=parsed_date_from,
                 date_to=parsed_date_to
             )
-            return schemas.JobStatistics(companies=companies_data)
+            payload = schemas.JobStatistics(companies=companies_data).model_dump_json()
+
+            # The statistics only change when a scrape lands and the view is
+            # refreshed, so a conditional request lets the browser skip the
+            # transfer entirely on reload and navigation. The tag is derived from
+            # the response body, which keeps it correct for every filter
+            # combination without having to reason about cache keys.
+            etag = '"%s"' % hashlib.sha256(payload.encode('utf-8')).hexdigest()[:32]
+            if request.headers.get('if-none-match') == etag:
+                return Response(status_code=304, headers={
+                    'ETag': etag,
+                    'Cache-Control': 'private, must-revalidate',
+                })
+
+            return Response(
+                content=payload,
+                media_type='application/json',
+                headers={
+                    'ETag': etag,
+                    # must-revalidate: always ask, but the answer is usually a
+                    # bodyless 304. Private because responses differ by API key
+                    # permission and must not be held in a shared cache.
+                    'Cache-Control': 'private, must-revalidate',
+                },
+            )
 
         # Return filtered jobs
         results, total = services.JobService.get_jobs_with_filters(

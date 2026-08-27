@@ -8,7 +8,9 @@ from app.database import Base
 class Company(Base):
     __tablename__ = "companies"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # primary_key already creates a unique index; index=True would add a second,
+    # redundant one on the same column.
+    id = Column(Integer, primary_key=True)
     name = Column(String(255), nullable=False, index=True)
     hidden = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -25,7 +27,9 @@ class Company(Base):
 class Job(Base):
     __tablename__ = "jobs"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # primary_key already creates a unique index; index=True would add a second,
+    # redundant one on the same column.
+    id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
 
     # External identifiers
@@ -82,7 +86,9 @@ class Job(Base):
 class Insert(Base):
     __tablename__ = "inserts"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # primary_key already creates a unique index; index=True would add a second,
+    # redundant one on the same column.
+    id = Column(Integer, primary_key=True)
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
     scrape_date = Column(Date, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -100,7 +106,9 @@ class Insert(Base):
 class APIKey(Base):
     __tablename__ = "api_keys"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # primary_key already creates a unique index; index=True would add a second,
+    # redundant one on the same column.
+    id = Column(Integer, primary_key=True)
     key = Column(String(64), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)

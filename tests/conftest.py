@@ -15,13 +15,18 @@ The URL names any existing database on the target server; the suite connects
 there only to create/drop `jobportal_test`.
 """
 import os
+import subprocess
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app import models
+
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 ADMIN_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -43,11 +48,20 @@ def engine():
         conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME}"))
     admin.dispose()
 
+    # Build the schema with Alembic rather than create_all, so the test database
+    # matches production exactly - including objects that only exist as
+    # migrations, such as the company_date_statistics materialized view.
+    # alembic/env.py takes its URL from settings, so it is pointed at the test
+    # database via the environment in a subprocess.
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=str(BACKEND_ROOT),
+        env={**os.environ, "DATABASE_URL": _test_db_url()},
+        check=True,
+        capture_output=True,
+    )
+
     eng = create_engine(_test_db_url())
-    # The application schema is owned by Alembic in production. For tests the
-    # models are the source of truth, which keeps the suite independent of
-    # migration history while still exercising the real DDL.
-    models.Base.metadata.create_all(bind=eng)
     yield eng
     eng.dispose()
 
@@ -61,6 +75,7 @@ def engine():
     admin.dispose()
 
 
+
 @pytest.fixture
 def db(engine):
     """A session against an empty schema. Every test starts from a clean slate."""
@@ -68,6 +83,11 @@ def db(engine):
     session = Session()
     for table in reversed(models.Base.metadata.sorted_tables):
         session.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
+    session.commit()
+    # The materialized view is not a table, so TRUNCATE does not reach it and it
+    # would otherwise still hold the previous test's rows. Rebuilding it against
+    # the now-empty tables empties it too.
+    session.execute(text("REFRESH MATERIALIZED VIEW company_date_statistics"))
     session.commit()
     yield session
     session.rollback()
@@ -154,14 +174,33 @@ def days():
 
 
 @pytest.fixture
-def stats(db):
+def refresh(db):
+    """
+    Rebuild the statistics view.
+
+    Statistics are precomputed, so nothing a test inserts is visible until this
+    runs - exactly as in production, where the scraper triggers a refresh after
+    a run. Tests seed data, refresh, then assert.
+    """
+    from app.services import JobService
+
+    def _refresh():
+        return JobService.refresh_statistics(db)
+    return _refresh
+
+
+@pytest.fixture
+def stats(db, refresh):
     """
     get_jobs_statistics reshaped for assertions:
     {company: {date: (open_positions, newly_added, removed)}}
+
+    Refreshes the view first so tests read their own seeded data.
     """
     from app.services import JobService
 
     def _stats(api_key, **kwargs):
+        refresh()
         raw = JobService.get_jobs_statistics(db, api_key, **kwargs)
         return {
             c["company_name"]: {

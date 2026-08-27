@@ -64,18 +64,20 @@ class TestWindowIsAPureSlice:
 
 
 class TestWindowEdges:
-    def test_window_before_all_data_is_empty(self, db, stats, admin_key, build):
+    def test_window_before_all_data_is_empty(self, db, refresh, admin_key, build):
         build.add("Acme", "2026-01-01", ["a"])
 
+        refresh()
         result = JobService.get_jobs_statistics(
             db, admin_key, date_from=date(2020, 1, 1), date_to=date(2020, 6, 1)
         )
 
         assert result == []
 
-    def test_window_after_all_data_is_empty(self, db, stats, admin_key, build):
+    def test_window_after_all_data_is_empty(self, db, refresh, admin_key, build):
         build.add("Acme", "2026-01-01", ["a"])
 
+        refresh()
         result = JobService.get_jobs_statistics(
             db, admin_key, date_from=date(2026, 6, 1)
         )

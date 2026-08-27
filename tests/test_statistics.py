@@ -71,10 +71,11 @@ class TestBasicCounts:
 
         assert result["Acme"][date(2026, 1, 8)] == (2, 1, 0)
 
-    def test_dates_are_returned_newest_first(self, db, stats, admin_key, build):
+    def test_dates_are_returned_newest_first(self, db, refresh, admin_key, build):
         build.add("Acme", "2026-01-01", ["a"])
         build.add("Acme", "2026-01-02", ["a"])
         build.add("Acme", "2026-01-03", ["a"])
+        refresh()
 
         raw = JobService.get_jobs_statistics(db, admin_key)
         dates = [d["date"] for d in raw[0]["dates"]]
@@ -183,5 +184,32 @@ class TestFilters:
         assert list(result["Acme"]) == [date(2026, 1, 2)]
         assert result["Acme"][date(2026, 1, 2)] == (2, 1, 1)
 
-    def test_empty_database_returns_nothing(self, db, stats, admin_key):
+    def test_empty_database_returns_nothing(self, db, refresh, admin_key):
+        refresh()
         assert JobService.get_jobs_statistics(db, admin_key) == []
+
+    def test_statistics_are_stale_until_refreshed(self, db, refresh, admin_key, build):
+        """
+        Documents the tradeoff of precomputing: new inserts are invisible until
+        the view is rebuilt. Production relies on the scraper calling
+        POST /api/statistics/refresh after a run.
+        """
+        build.add("Acme", "2026-01-01", ["a"])
+        refresh()
+        assert len(JobService.get_jobs_statistics(db, admin_key)[0]["dates"]) == 1
+
+        build.add("Acme", "2026-01-02", ["a", "b"])
+
+        # Not yet visible.
+        assert len(JobService.get_jobs_statistics(db, admin_key)[0]["dates"]) == 1
+
+        refresh()
+        assert len(JobService.get_jobs_statistics(db, admin_key)[0]["dates"]) == 2
+
+    def test_refresh_reports_what_it_rebuilt(self, db, refresh, build):
+        build.add("Acme", "2026-01-01", ["a"])
+
+        result = refresh()
+
+        assert result["rows"] > 0
+        assert isinstance(result["concurrent"], bool)
