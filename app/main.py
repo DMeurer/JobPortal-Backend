@@ -329,22 +329,25 @@ def get_jobs(
             # the response body, which keeps it correct for every filter
             # combination without having to reason about cache keys.
             etag = '"%s"' % hashlib.sha256(payload.encode('utf-8')).hexdigest()[:32]
+
+            # max-age=0 is load-bearing. "private, must-revalidate" alone gives
+            # the browser no freshness directive, so it never stores the response
+            # and therefore never sends If-None-Match - the ETag was being
+            # ignored and every navigation re-downloaded the full body.
+            # max-age=0 means "store it, but revalidate before every reuse",
+            # which is what turns the repeat request into a bodyless 304.
+            cache_headers = {
+                'ETag': etag,
+                'Cache-Control': 'private, max-age=0, must-revalidate',
+            }
+
             if request.headers.get('if-none-match') == etag:
-                return Response(status_code=304, headers={
-                    'ETag': etag,
-                    'Cache-Control': 'private, must-revalidate',
-                })
+                return Response(status_code=304, headers=cache_headers)
 
             return Response(
                 content=payload,
                 media_type='application/json',
-                headers={
-                    'ETag': etag,
-                    # must-revalidate: always ask, but the answer is usually a
-                    # bodyless 304. Private because responses differ by API key
-                    # permission and must not be held in a shared cache.
-                    'Cache-Control': 'private, must-revalidate',
-                },
+                headers=cache_headers,
             )
 
         # Return filtered jobs
