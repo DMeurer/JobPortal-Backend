@@ -89,6 +89,13 @@ class Insert(Base):
 
     job = relationship("Job", back_populates="inserts")
 
+    # A job is recorded at most once per scrape date. create_insert() checks for
+    # an existing row first, but that is a check-then-act; this makes it safe
+    # under concurrent scrapers.
+    __table_args__ = (
+        Index('ix_inserts_job_id_scrape_date', 'job_id', 'scrape_date', unique=True),
+    )
+
 
 class APIKey(Base):
     __tablename__ = "api_keys"

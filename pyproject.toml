@@ -19,4 +19,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
-dev-dependencies = []
+dev-dependencies = [
+    "pytest==8.3.4",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests need a real PostgreSQL: the statistics query uses window functions and
+# FILTER, and the whole point is to verify behaviour against the real planner.
+# TEST_DATABASE_URL selects the database; see tests/conftest.py.
+addopts = "-q"

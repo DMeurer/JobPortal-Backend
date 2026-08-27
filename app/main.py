@@ -10,7 +10,12 @@ from app.auth import require_admin_permission, require_read_permission, require_
 from app.services import APIKeyService
 from app.init import init_fixed_api_keys
 
-models.Base.metadata.create_all(bind=engine)
+# NOTE: the schema is owned by Alembic, which docker-entrypoint.sh runs via
+# `alembic upgrade head` before starting the app. Calling
+# `models.Base.metadata.create_all()` here as well gave two competing sources of
+# truth: if a model ever drifted from the migrations, create_all would silently
+# create the un-migrated shape while alembic_version still reported the database
+# as current.
 
 
 @asynccontextmanager

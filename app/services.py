@@ -1,4 +1,5 @@
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from datetime import date
 from typing import Optional, List
@@ -347,7 +348,16 @@ class JobService:
             scrape_date=scrape_date
         )
         db.add(insert)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent scraper inserted the same (job_id, scrape_date)
+            # between the check above and this commit. The unique index added in
+            # b7e1a4c92f03 turns that race into an error instead of a duplicate
+            # row, and the outcome the caller cares about - the row exists - is
+            # already true, so this is reported the same way as "already exists".
+            db.rollback()
+            return None
         db.refresh(insert)
 
         return insert
