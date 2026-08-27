@@ -1,8 +1,144 @@
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from datetime import date
 from typing import Optional, List
 from app import models, schemas
 from app.sanitize import sanitize_like_pattern, sanitize_regex, sanitize_string
+
+
+# Statistics are computed entirely in the database. The previous implementation
+# loaded every (company, date, job_id) insert row into Python and did the set
+# arithmetic there; on ~240k rows that cost ~2.7s of pure Python per request
+# while the underlying scan takes ~200ms.
+#
+# Semantics that must be preserved exactly:
+#   * Grouping is by company NAME, not id. `companies` has a unique index on
+#     (name, hidden), so one name can map to two rows (e.g. a hidden and a
+#     visible variant) and the original code merged them via a dict keyed on
+#     name. `name_key` reproduces that by collapsing every id sharing a name
+#     onto the smallest such id, while keeping join keys integral.
+#   * "Previous date" means the previous date that exists FOR THAT NAME, not
+#     the previous calendar day.
+#   * A company's first date reports newly_added = open_positions, removed = 0.
+#   * found_on_date filters the OUTPUT only; the diff against the previous date
+#     is still computed from the full history.
+#   * Duplicate (job, date) inserts collapse. create_insert() already dedupes in
+#     application code, but nothing in the schema enforces it, so DISTINCT stays.
+#
+# `removed` uses a set identity rather than a second 240k-row join:
+#     removed(d) = |P \ D| = |P| - |P n D| = open(prev) - open(d) + new(d)
+# which reduces it to a LAG over the ~1.8k-row aggregate.
+_JOB_STATISTICS_SQL = text("""
+WITH company_key AS (
+    SELECT
+        c.id                                 AS company_id,
+        min(c.id) OVER (PARTITION BY c.name) AS name_key,
+        c.name                               AS company_name
+    FROM companies c
+    WHERE (:include_hidden OR c.hidden = false)
+      AND (CAST(:company_name AS varchar) IS NULL OR c.name = :company_name)
+      AND (CAST(:company_names AS varchar[]) IS NULL
+           OR c.name = ANY(CAST(:company_names AS varchar[])))
+),
+-- Every (company, scrape_date) pair. Aggregate only, so this stays cheap even
+-- though it touches the whole inserts table.
+all_days AS (
+    SELECT ck.name_key, i.scrape_date
+    FROM inserts i
+    JOIN jobs        j  ON i.job_id     = j.id
+    JOIN company_key ck ON j.company_id = ck.company_id
+    GROUP BY ck.name_key, i.scrape_date
+),
+-- The last scrape date strictly BEFORE the requested window, per company.
+-- The first in-window date must still be diffed against this, otherwise it
+-- would report every open position as newly added.
+lead_in AS (
+    SELECT name_key, max(scrape_date) AS scrape_date
+    FROM all_days
+    WHERE CAST(:date_from AS date) IS NOT NULL
+      AND scrape_date < :date_from
+    GROUP BY name_key
+),
+-- Window plus one lead-in row per company. The lead-in row is dropped at the
+-- very end; it exists so LAG(open_positions) has something to read.
+day AS (
+    SELECT d.name_key, d.scrape_date, d.prev_date
+    FROM (
+        SELECT
+            name_key,
+            scrape_date,
+            LAG(scrape_date) OVER (
+                PARTITION BY name_key ORDER BY scrape_date
+            ) AS prev_date
+        FROM all_days
+    ) d
+    LEFT JOIN lead_in li ON li.name_key = d.name_key
+    WHERE (CAST(:date_to AS date) IS NULL OR d.scrape_date <= :date_to)
+      AND (CAST(:date_from AS date) IS NULL
+           OR d.scrape_date >= COALESCE(li.scrape_date, :date_from))
+),
+-- Only the job rows the window actually needs. This is what makes a narrow
+-- range cheaper to compute, rather than merely cheaper to transfer.
+presence AS (
+    SELECT DISTINCT
+        ck.name_key,
+        i.scrape_date,
+        i.job_id
+    FROM inserts i
+    JOIN jobs        j  ON i.job_id     = j.id
+    JOIN company_key ck ON j.company_id = ck.company_id
+    WHERE (CAST(:date_to AS date) IS NULL OR i.scrape_date <= :date_to)
+      AND (CAST(:date_from AS date) IS NULL
+           OR i.scrape_date >= (
+                SELECT COALESCE(min(scrape_date), CAST(:date_from AS date))
+                FROM lead_in
+           ))
+),
+agg AS (
+    SELECT
+        d.name_key,
+        d.scrape_date,
+        count(*)                                 AS open_positions,
+        count(*) FILTER (WHERE p.job_id IS NULL) AS newly_added
+    FROM day d
+    JOIN presence c
+      ON c.name_key    = d.name_key
+     AND c.scrape_date = d.scrape_date
+    LEFT JOIN presence p
+      ON p.name_key    = d.name_key
+     AND p.scrape_date = d.prev_date
+     AND p.job_id      = c.job_id
+    GROUP BY d.name_key, d.scrape_date
+),
+final AS (
+    SELECT
+        name_key,
+        scrape_date,
+        open_positions,
+        newly_added,
+        COALESCE(
+            LAG(open_positions) OVER (PARTITION BY name_key ORDER BY scrape_date)
+              - open_positions + newly_added,
+            0
+        ) AS removed
+    FROM agg
+),
+names AS (
+    SELECT DISTINCT name_key, company_name FROM company_key
+)
+SELECT
+    n.company_name,
+    f.scrape_date,
+    f.open_positions,
+    f.newly_added,
+    f.removed
+FROM final f
+JOIN names n ON n.name_key = f.name_key
+WHERE (CAST(:found_on_date AS date) IS NULL OR f.scrape_date = :found_on_date)
+  -- drop the lead-in row that only existed to seed LAG
+  AND (CAST(:date_from AS date) IS NULL OR f.scrape_date >= :date_from)
+ORDER BY n.company_name, f.scrape_date DESC
+""")
 
 
 class JobService:
@@ -612,7 +748,9 @@ class JobService:
         api_key: Optional[models.APIKey] = None,
         company_name: Optional[str] = None,
         company_names: Optional[List[str]] = None,
-        found_on_date: Optional[date] = None
+        found_on_date: Optional[date] = None,
+        date_from: Optional[date] = None,
+        date_to: Optional[date] = None
     ) -> List[dict]:
         """
         Get job statistics grouped by company and date.
@@ -622,103 +760,70 @@ class JobService:
         - newly_added: Jobs on current date that weren't on previous date
         - removed: Jobs on previous date that aren't on current date
 
+        The aggregation runs in the database (see _JOB_STATISTICS_SQL); this
+        function only reshapes the flat result into the nested per-company form.
+
         Args:
             db: Database session
             api_key: API key to check hidden permissions
             company_name: Filter by company name (exact match)
             company_names: Filter by multiple company names
-            found_on_date: Filter to only include this specific date
+            found_on_date: Filter to only include this specific date. Applied to
+                the output only - newly_added/removed are still computed against
+                the true previous scrape date.
+            date_from: Only report dates >= this. newly_added/removed for the
+                first reported date are still computed against the last scrape
+                date before it, so a narrow window does not report every open
+                position as newly added.
+            date_to: Only report dates <= this.
 
         Returns:
             List of dictionaries with company statistics (filtered by hidden status)
         """
-        # Get all inserts with job and company information
-        # We need the actual job IDs to compare between dates
-        query = db.query(
-            models.Company.name.label('company_name'),
-            models.Insert.scrape_date.label('date'),
-            models.Insert.job_id.label('job_id')
-        ).join(
-            models.Job,
-            models.Insert.job_id == models.Job.id
-        ).join(
-            models.Company,
-            models.Job.company_id == models.Company.id
-        )
+        # Mirrors _apply_hidden_filter: admin or read_hidden sees hidden companies.
+        include_hidden = bool(api_key and (api_key.read_hidden or api_key.admin))
 
-        # Apply hidden filter
-        query = JobService._apply_hidden_filter(query, api_key)
+        rows = db.execute(
+            _JOB_STATISTICS_SQL,
+            {
+                "include_hidden": include_hidden,
+                "company_name": company_name,
+                "company_names": list(company_names) if company_names else None,
+                "found_on_date": found_on_date,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+        ).all()
 
-        # Apply company filters
-        if company_name:
-            query = query.filter(models.Company.name == company_name)
-        if company_names:
-            query = query.filter(models.Company.name.in_(company_names))
+        # Rows arrive ordered by company_name, then scrape_date DESC, so a single
+        # pass builds the nested structure without any sorting or lookups.
+        result: List[dict] = []
+        current_name = None
+        dates_stats: List[dict] = []
 
-        query = query.order_by(
-            models.Company.name,
-            models.Insert.scrape_date.desc()
-        )
+        for row in rows:
+            if row.company_name != current_name:
+                if dates_stats:
+                    result.append({
+                        'company_name': current_name,
+                        'dates': dates_stats
+                    })
+                current_name = row.company_name
+                dates_stats = []
 
-        results = query.all()
+            dates_stats.append({
+                'date': row.scrape_date,
+                'open_positions': row.open_positions,
+                'newly_added': row.newly_added,
+                'removed': row.removed
+            })
 
-        # Group jobs by company and date
-        company_date_jobs = {}
-        for row in results:
-            company_name = row.company_name
-            scrape_date = row.date
-            job_id = row.job_id
-
-            if company_name not in company_date_jobs:
-                company_date_jobs[company_name] = {}
-
-            if scrape_date not in company_date_jobs[company_name]:
-                company_date_jobs[company_name][scrape_date] = set()
-
-            company_date_jobs[company_name][scrape_date].add(job_id)
-
-        # Calculate statistics for each company
-        result = []
-        for comp_name, date_jobs in company_date_jobs.items():
-            # Sort dates in descending order
-            sorted_dates = sorted(date_jobs.keys(), reverse=True)
-
-            dates_stats = []
-            for i, current_date in enumerate(sorted_dates):
-                # Skip dates that don't match the filter (if specified)
-                if found_on_date and current_date != found_on_date:
-                    continue
-
-                current_jobs = date_jobs[current_date]
-                open_positions = len(current_jobs)
-
-                # Calculate newly added and removed compared to previous date
-                # Find the previous date in the sorted list
-                prev_idx = i + 1
-                if prev_idx < len(sorted_dates):
-                    previous_date = sorted_dates[prev_idx]
-                    previous_jobs = date_jobs[previous_date]
-
-                    newly_added = len(current_jobs - previous_jobs)
-                    removed = len(previous_jobs - current_jobs)
-                else:
-                    # No previous date, all jobs are newly added
-                    newly_added = open_positions
-                    removed = 0
-
-                dates_stats.append({
-                    'date': current_date,
-                    'open_positions': open_positions,
-                    'newly_added': newly_added,
-                    'removed': removed
-                })
-
-            # Only include company if it has matching dates
-            if dates_stats:
-                result.append({
-                    'company_name': comp_name,
-                    'dates': dates_stats
-                })
+        # Only include company if it has matching dates
+        if dates_stats:
+            result.append({
+                'company_name': current_name,
+                'dates': dates_stats
+            })
 
         return result
 

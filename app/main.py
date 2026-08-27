@@ -172,6 +172,8 @@ def get_jobs(
     company_names: Optional[str] = Query(None, description="Filter by multiple company names (comma-separated)"),
     company_id: Optional[int] = Query(None, description="Filter by company ID"),
     found_on_date: Optional[str] = Query(None, description="Filter by scrape date (YYYY-MM-DD or 'today')"),
+    date_from: Optional[str] = Query(None, description="Statistics only: earliest scrape date to report (YYYY-MM-DD). May not be in the future."),
+    date_to: Optional[str] = Query(None, description="Statistics only: latest scrape date to report (YYYY-MM-DD). May not be in the future."),
     job_status: Optional[str] = Query(None, description="Filter by job status: 'new', 'existing', or 'removed' (requires found_on_date and company_name)"),
     title_contains: Optional[str] = Query(None, description="Filter jobs containing this substring in title"),
     title_excludes: Optional[str] = Query(None, description="Exclude jobs containing this substring in title"),
@@ -241,12 +243,46 @@ def get_jobs(
 
         # Return statistics if requested
         if statistics:
+            # Parse and validate the reporting window. Future dates are rejected
+            # because no scrape can exist for them.
+            today = date.today()
+
+            def _parse_window(value: Optional[str], label: str) -> Optional[date]:
+                if not value:
+                    return None
+                if value.lower() == "today":
+                    return today
+                try:
+                    parsed = date.fromisoformat(value)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid {label} format. Use YYYY-MM-DD or 'today'"
+                    )
+                if parsed > today:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} may not be in the future"
+                    )
+                return parsed
+
+            parsed_date_from = _parse_window(date_from, "date_from")
+            parsed_date_to = _parse_window(date_to, "date_to")
+
+            if parsed_date_from and parsed_date_to and parsed_date_from > parsed_date_to:
+                raise HTTPException(
+                    status_code=400,
+                    detail="date_from may not be after date_to"
+                )
+
             companies_data = services.JobService.get_jobs_statistics(
                 db=db,
                 api_key=current_key,
                 company_name=company_name,
                 company_names=company_names_list,
-                found_on_date=parsed_found_on_date
+                found_on_date=parsed_found_on_date,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to
             )
             return schemas.JobStatistics(companies=companies_data)
 
@@ -304,6 +340,10 @@ def get_jobs(
             skip=skip,
             limit=limit or total
         )
+    except HTTPException:
+        # Validation errors raised above are already correct responses; without
+        # this they would be swallowed by the handler below and returned as 500.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
