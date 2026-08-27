@@ -75,6 +75,32 @@ _REFRESH_STATISTICS_BLOCKING_SQL = text(
     "REFRESH MATERIALIZED VIEW company_date_statistics"
 )
 
+# Records when the view was last rebuilt. Health checks compare this against the
+# newest insert to decide whether the dashboard is showing current numbers.
+_MARK_STATISTICS_REFRESHED_SQL = text("""
+INSERT INTO statistics_refresh (id, refreshed_at)
+VALUES (true, now())
+ON CONFLICT (id) DO UPDATE SET refreshed_at = now()
+""")
+
+
+# Everything /health/data needs, in one round trip.
+#
+# last_insert_at is when data most recently LANDED, which is the honest measure
+# of "did the scrapers run" - scrape_date is a calendar date and cannot express
+# an age in hours. stale compares that against the refresh marker rather than
+# comparing max(scrape_date), which would miss a re-run that adds rows to a date
+# already present.
+_STATISTICS_HEALTH_SQL = text("""
+SELECT
+    (SELECT max(created_at) FROM inserts)                       AS last_insert_at,
+    (SELECT max(scrape_date) FROM inserts)                      AS last_scrape_date,
+    (SELECT refreshed_at FROM statistics_refresh LIMIT 1)       AS refreshed_at,
+    (SELECT count(*) FROM company_date_statistics)              AS view_rows,
+    EXTRACT(EPOCH FROM (now() - (SELECT max(created_at) FROM inserts))) / 3600.0
+                                                                AS data_age_hours
+""")
+
 
 class JobService:
     """Service layer for job-related operations."""
@@ -804,7 +830,68 @@ class JobService:
             text("SELECT count(*) FROM company_date_statistics")
         ).scalar()
 
+        # Record the rebuild so health checks can tell whether the view is behind
+        # the data it summarises.
+        db.execute(_MARK_STATISTICS_REFRESHED_SQL)
+        db.commit()
+
         return {'rows': int(rows or 0), 'concurrent': concurrent}
+
+    @staticmethod
+    def statistics_health(db: Session, max_age_hours: float) -> dict:
+        """
+        Report whether the statistics the dashboard serves are trustworthy.
+
+        Two independent failure modes, both invisible from the UI:
+          - the scrapers stopped running, so the data is old
+          - the scrapers ran but the view was not refreshed, so the dashboard
+            keeps serving the previous run's numbers
+
+        Args:
+            db: Database session
+            max_age_hours: how old the newest data may be before it counts as stale
+
+        Returns:
+            dict with 'healthy' plus the details behind the verdict
+        """
+        row = db.execute(_STATISTICS_HEALTH_SQL).one()
+
+        problems = []
+
+        if row.last_insert_at is None:
+            # An empty database is reported as unhealthy rather than quietly OK:
+            # "no data at all" is exactly the condition monitoring should catch.
+            problems.append('no scrape data')
+            age_hours = None
+        else:
+            age_hours = float(row.data_age_hours)
+            if age_hours > max_age_hours:
+                problems.append(
+                    f'newest data is {age_hours:.1f}h old (limit {max_age_hours:.0f}h)'
+                )
+
+        # The view is behind if data landed after the last rebuild. A missing
+        # marker means it has never been refreshed through the application.
+        stale = False
+        if row.last_insert_at is not None:
+            if row.refreshed_at is None:
+                stale = True
+                problems.append('statistics have never been refreshed')
+            elif row.last_insert_at > row.refreshed_at:
+                stale = True
+                problems.append('statistics are behind the data')
+
+        return {
+            'healthy': not problems,
+            'problems': problems,
+            'last_scrape_date': row.last_scrape_date,
+            'last_insert_at': row.last_insert_at,
+            'statistics_refreshed_at': row.refreshed_at,
+            'statistics_rows': int(row.view_rows or 0),
+            'data_age_hours': round(age_hours, 1) if age_hours is not None else None,
+            'max_age_hours': max_age_hours,
+            'statistics_stale': stale,
+        }
 
     def get_statistics_online_time(self, db: Session, company_name: Optional[str] = None):
         """

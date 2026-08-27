@@ -2,6 +2,8 @@ import hashlib
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typing import List, Optional, Union
 from datetime import date
@@ -11,6 +13,7 @@ from app.database import engine, get_db
 from app.auth import require_admin_permission, require_read_permission, require_write_permission
 from app.services import APIKeyService
 from app.init import init_fixed_api_keys
+from app.config import get_settings
 
 # NOTE: the schema is owned by Alembic, which docker-entrypoint.sh runs via
 # `alembic upgrade head` before starting the app. Calling
@@ -152,6 +155,67 @@ def list_api_keys(
         List of API keys without key values
     """
     return APIKeyService.get_all_api_keys(db)
+
+
+@app.get("/health")
+def health(db: Session = Depends(get_db)):
+    """
+    Liveness check. Unauthenticated so a monitor can reach it without a key, and
+    so a database outage is reported as such rather than failing during auth.
+
+    Returns 200 when the application is up and the database answers, 503
+    otherwise, so a plain HTTP monitor can be pointed straight at it.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "database": "unreachable", "detail": str(e)},
+        )
+
+    return {"status": "ok", "database": "ok"}
+
+
+@app.get("/health/data")
+def health_data(db: Session = Depends(get_db)):
+    """
+    Data freshness check. Unauthenticated, and reports only timestamps and counts.
+
+    Returns 503 when the scrapers appear to have stopped, or when the statistics
+    view is behind the data it summarises. The second case is the one that cannot
+    be seen from the UI: the dashboard keeps serving the previous run's numbers
+    and looks entirely normal.
+
+    Intended for a plain HTTP monitor; the JSON body says which check failed.
+    """
+    try:
+        settings = get_settings()
+        result = services.JobService.statistics_health(
+            db, settings.statistics_max_age_hours
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "detail": str(e)},
+        )
+
+    body = {
+        "status": "ok" if result["healthy"] else "unhealthy",
+        "problems": result["problems"],
+        "last_scrape_date": result["last_scrape_date"].isoformat()
+            if result["last_scrape_date"] else None,
+        "last_insert_at": result["last_insert_at"].isoformat()
+            if result["last_insert_at"] else None,
+        "statistics_refreshed_at": result["statistics_refreshed_at"].isoformat()
+            if result["statistics_refreshed_at"] else None,
+        "statistics_stale": result["statistics_stale"],
+        "statistics_rows": result["statistics_rows"],
+        "data_age_hours": result["data_age_hours"],
+        "max_age_hours": result["max_age_hours"],
+    }
+
+    return JSONResponse(status_code=200 if result["healthy"] else 503, content=body)
 
 
 @app.post("/api/statistics/refresh")

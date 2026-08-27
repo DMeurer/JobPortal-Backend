@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # hanging indefinitely.
     db_pool_timeout: int = 30
 
+    # How old the newest scrape data may be before /health/data reports
+    # unhealthy. The scrapers run daily at 02:00, so this tolerates a late run
+    # without tolerating a missed one.
+    statistics_max_age_hours: float = 30.0
+
     class Config:
         env_file = ".env"
         case_sensitive = False

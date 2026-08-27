@@ -1,5 +1,5 @@
 import secrets
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Date, Boolean, Index
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Date, Boolean, Index, CheckConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -100,6 +100,27 @@ class Insert(Base):
     # under concurrent scrapers.
     __table_args__ = (
         Index('ix_inserts_job_id_scrape_date', 'job_id', 'scrape_date', unique=True),
+    )
+
+
+class StatisticsRefresh(Base):
+    """
+    Single-row marker recording when company_date_statistics was last rebuilt.
+
+    Postgres does not expose a materialized view's last refresh time, and
+    comparing max(scrape_date) between the view and `inserts` is not enough: a
+    re-run that adds rows to a date already present leaves the maximum unchanged
+    while still making the view wrong. Comparing this timestamp against
+    max(inserts.created_at) detects every case, which is what /health/data needs.
+    """
+    __tablename__ = "statistics_refresh"
+
+    # Constrained to a single row by the CHECK below.
+    id = Column(Boolean, primary_key=True, default=True)
+    refreshed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint('id', name='statistics_refresh_single_row'),
     )
 
 
