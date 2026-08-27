@@ -28,6 +28,34 @@ from app.sanitize import sanitize_like_pattern, sanitize_regex, sanitize_string
 # `removed` uses a set identity rather than a second 240k-row join:
 #     removed(d) = |P \ D| = |P| - |P n D| = open(prev) - open(d) + new(d)
 # which reduces it to a LAG over the ~1.8k-row aggregate.
+# Lower bound for the presence scan, resolved BEFORE the main query.
+#
+# This deliberately does not live inside _JOB_STATISTICS_SQL. Postgres cannot
+# estimate the selectivity of `scrape_date >= (SELECT ...)`, so it falls back to
+# a default guess and underestimated the surviving rows by ~60x (1.2k estimated
+# vs 72k actual). Downstream that flips the presence self-join from a hash join
+# to a nested loop over tens of thousands of rows on each side, which does not
+# finish. Passing a plain date instead lets the planner use real column
+# statistics.
+#
+# Aggregate-only, so it is cheap despite touching the whole inserts table.
+_STATISTICS_LEAD_IN_SQL = text("""
+SELECT min(prev_date) AS lower_bound
+FROM (
+    SELECT max(i.scrape_date) AS prev_date
+    FROM inserts i
+    JOIN jobs      j ON i.job_id     = j.id
+    JOIN companies c ON j.company_id = c.id
+    WHERE (:include_hidden OR c.hidden = false)
+      AND (CAST(:company_name AS varchar) IS NULL OR c.name = :company_name)
+      AND (CAST(:company_names AS varchar[]) IS NULL
+           OR c.name = ANY(CAST(:company_names AS varchar[])))
+      AND i.scrape_date < :date_from
+    GROUP BY c.name
+) per_company
+""")
+
+
 _JOB_STATISTICS_SQL = text("""
 WITH company_key AS (
     SELECT
@@ -79,6 +107,8 @@ day AS (
 ),
 -- Only the job rows the window actually needs. This is what makes a narrow
 -- range cheaper to compute, rather than merely cheaper to transfer.
+-- :presence_from is resolved by _STATISTICS_LEAD_IN_SQL rather than computed
+-- inline, so the planner can estimate this filter from real statistics.
 presence AS (
     SELECT DISTINCT
         ck.name_key,
@@ -88,11 +118,8 @@ presence AS (
     JOIN jobs        j  ON i.job_id     = j.id
     JOIN company_key ck ON j.company_id = ck.company_id
     WHERE (CAST(:date_to AS date) IS NULL OR i.scrape_date <= :date_to)
-      AND (CAST(:date_from AS date) IS NULL
-           OR i.scrape_date >= (
-                SELECT COALESCE(min(scrape_date), CAST(:date_from AS date))
-                FROM lead_in
-           ))
+      AND (CAST(:presence_from AS date) IS NULL
+           OR i.scrape_date >= CAST(:presence_from AS date))
 ),
 agg AS (
     SELECT
@@ -783,15 +810,34 @@ class JobService:
         # Mirrors _apply_hidden_filter: admin or read_hidden sees hidden companies.
         include_hidden = bool(api_key and (api_key.read_hidden or api_key.admin))
 
+        filters = {
+            "include_hidden": include_hidden,
+            "company_name": company_name,
+            "company_names": list(company_names) if company_names else None,
+        }
+
+        # Resolve how far back the presence scan must reach. The window's first
+        # reported date is diffed against the last scrape date before it, so that
+        # date's rows have to be in scope. Done as a separate aggregate query so
+        # the main query receives a plain date it can plan against - see the note
+        # on _STATISTICS_LEAD_IN_SQL.
+        presence_from = None
+        if date_from is not None:
+            presence_from = db.execute(
+                _STATISTICS_LEAD_IN_SQL, {**filters, "date_from": date_from}
+            ).scalar()
+            # No company has data before the window; nothing to reach back to.
+            if presence_from is None:
+                presence_from = date_from
+
         rows = db.execute(
             _JOB_STATISTICS_SQL,
             {
-                "include_hidden": include_hidden,
-                "company_name": company_name,
-                "company_names": list(company_names) if company_names else None,
+                **filters,
                 "found_on_date": found_on_date,
                 "date_from": date_from,
                 "date_to": date_to,
+                "presence_from": presence_from,
             },
         ).all()
 
